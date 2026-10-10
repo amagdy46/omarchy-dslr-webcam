@@ -68,6 +68,7 @@ DSLR_WEBCAM_MIRROR=1              # flip horizontally
 DSLR_WEBCAM_FPS=30
 DSLR_WEBCAM_DEVICE=/dev/video9    # pin a specific loopback device
 DSLR_WEBCAM_EXTRA_FILTERS="eq=brightness=0.05"
+DSLR_WEBCAM_PATCH_ROWS="596:4"   # hide a bright line the camera burns into live view ("auto" = known models)
 ```
 
 Then run `dslr-webcam restart`.
@@ -77,6 +78,7 @@ The bar widget's settings (`hideWhenDisconnected`, `pollIntervalSec`) go in its 
 ## Limitations
 
 - **Resolution is limited by the camera's USB live view**, not by its sensor. Most entry-level Canons send about 1056×704 MJPEG at 25–30 fps. Clean HDMI out with a capture card gives a better image, if your body supports it.
+- **Some bodies burn a bright horizontal line into USB live view.** The EOS 4000D draws one at rows 597–598 of its 1056×704 frame, in the camera's own JPEGs. It is covered automatically for the 4000D. For another body with the same problem, set `DSLR_WEBCAM_PATCH_ROWS` (and please open an issue so it can be added).
 - **One reader at a time.** Two apps opening the loopback device at once fight over the format. If OBS is using the DSLR, use OBS's Virtual Camera for everything else.
 - **Don't run other `gphoto2` commands while streaming.** The camera allows one PTP session. Run `dslr-webcam off` first.
 - If GNOME/gvfs auto-mounts the camera, the service unmounts it before streaming.

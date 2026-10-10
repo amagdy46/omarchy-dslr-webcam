@@ -21,6 +21,8 @@ DSLR_WEBCAM_FPS=""                    # empty = camera rate (~25-30 fps)
 DSLR_WEBCAM_MIRROR=0                  # 1 = flip horizontally
 DSLR_WEBCAM_DISABLE_AUTOPOWEROFF=1    # set the camera's autopoweroff to 0 before streaming
 DSLR_WEBCAM_EXTRA_FILTERS=""          # appended to the ffmpeg -vf chain
+DSLR_WEBCAM_PATCH_ROWS="auto"         # "Y:H" hides a bad H-row band at Y in the camera
+                                      # frame (even values); "auto" = known models, "" = off
 
 # shellcheck source=/dev/null
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
@@ -101,13 +103,33 @@ service_state() { systemctl --user is-active "$SERVICE" 2>/dev/null || true; }
 
 # --- Streaming ---------------------------------------------------------------
 
+# Some bodies burn a bright horizontal line into their USB live view frames
+# (the EOS 4000D at rows 597-598 of 1056x704). Prints the band to cover as
+# "Y:H", even-aligned because 4:2:0 overlays snap to even rows.
+patch_rows() {
+  if [[ $DSLR_WEBCAM_PATCH_ROWS != auto ]]; then
+    echo "$DSLR_WEBCAM_PATCH_ROWS"
+    return
+  fi
+  case "$(camera_model)" in
+    *"EOS 4000D"* | *"Rebel T100"*) echo "596:4" ;;
+  esac
+}
+
 video_filters() {
-  local filters="" w h
+  local filters="" w h patch y n
+  patch=$(patch_rows)
+  if [[ $patch == *:* ]]; then
+    y=${patch%:*}
+    n=${patch#*:}
+    # Cover the band with the rows directly above it.
+    filters="split[dw_main][dw_src];[dw_src]crop=iw:$n:0:$((y - n))[dw_patch];[dw_main][dw_patch]overlay=0:$y"
+  fi
   if [[ $DSLR_WEBCAM_RESOLUTION != native ]]; then
     w=${DSLR_WEBCAM_RESOLUTION%x*}
     h=${DSLR_WEBCAM_RESOLUTION#*x}
     # Crop the camera's 3:2 live view to the target aspect, then scale.
-    filters="crop='min(iw,ih*$w/$h)':'min(ih,iw*$h/$w)',scale=$w:$h"
+    filters="${filters:+$filters,}crop='min(iw,ih*$w/$h)':'min(ih,iw*$h/$w)',scale=$w:$h"
   fi
   [[ $DSLR_WEBCAM_MIRROR == 1 ]] && filters="${filters:+$filters,}hflip"
   [[ -n $DSLR_WEBCAM_FPS ]] && filters="${filters:+$filters,}fps=$DSLR_WEBCAM_FPS"
@@ -161,6 +183,10 @@ cmd_run() {
   dev=$(loopback_device) || die "no v4l2loopback device found; run 'dslr-webcam doctor'"
 
   trap 'pkill -P $$ 2>/dev/null; rm -f "$WRITER_PID_FILE"; exit 0' TERM INT
+
+  # Stopping a stream mid-transfer leaves the camera's PTP session wedged, so
+  # start every run from a clean USB state.
+  gphoto2 --reset >/dev/null 2>&1 && sleep 3
 
   while true; do
     if ! camera_connected; then
