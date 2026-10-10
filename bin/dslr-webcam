@@ -117,19 +117,26 @@ patch_rows() {
 }
 
 video_filters() {
-  local filters="" w h patch y n
+  local filters="" w h patch y n crop_y="(ih-oh)/2"
   patch=$(patch_rows)
   if [[ $patch == *:* ]]; then
     y=${patch%:*}
     n=${patch#*:}
-    # Cover the band with the rows directly above it.
-    filters="split[dw_main][dw_src];[dw_src]crop=iw:$n:0:$((y - n))[dw_patch];[dw_main][dw_patch]overlay=0:$y"
   fi
   if [[ $DSLR_WEBCAM_RESOLUTION != native ]]; then
     w=${DSLR_WEBCAM_RESOLUTION%x*}
     h=${DSLR_WEBCAM_RESOLUTION#*x}
+    if [[ -n ${y:-} ]]; then
+      # Slide the crop window off the bad band: keep it centered if it already
+      # misses the band, otherwise end it just above (or start just below) it.
+      crop_y="if(lt($y,(ih+oh)/2)*gt($((y + n)),(ih-oh)/2),if(gte($y-oh,0),$y-oh,$((y + n))),(ih-oh)/2)"
+    fi
     # Crop the camera's 3:2 live view to the target aspect, then scale.
-    filters="${filters:+$filters,}crop='min(iw,ih*$w/$h)':'min(ih,iw*$h/$w)',scale=$w:$h"
+    filters="crop='min(iw,ih*$w/$h)':'min(ih,iw*$h/$w)':'(iw-ow)/2':'$crop_y',scale=$w:$h"
+  elif [[ -n ${y:-} ]]; then
+    # Full frame requested, so the band can only be covered: copy the rows
+    # directly above it over it.
+    filters="split[dw_main][dw_src];[dw_src]crop=iw:$n:0:$((y - n))[dw_patch];[dw_main][dw_patch]overlay=0:$y"
   fi
   [[ $DSLR_WEBCAM_MIRROR == 1 ]] && filters="${filters:+$filters,}hflip"
   [[ -n $DSLR_WEBCAM_FPS ]] && filters="${filters:+$filters,}fps=$DSLR_WEBCAM_FPS"

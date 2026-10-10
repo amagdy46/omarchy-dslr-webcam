@@ -78,7 +78,7 @@ The bar widget's settings (`hideWhenDisconnected`, `pollIntervalSec`) go in its 
 ## Limitations
 
 - **Resolution is limited by the camera's USB live view**, not by its sensor. Most entry-level Canons send about 1056×704 MJPEG at 25–30 fps. Clean HDMI out with a capture card gives a better image, if your body supports it.
-- **Some bodies burn a bright horizontal line into USB live view.** The EOS 4000D draws one at rows 597–598 of its 1056×704 frame, in the camera's own JPEGs. It is covered automatically for the 4000D. For another body with the same problem, set `DSLR_WEBCAM_PATCH_ROWS` (and please open an issue so it can be added).
+- **Some bodies have a bad sensor row that shows only in live view.** The test EOS 4000D shows a bright line at rows 597–598 of its 1056×704 live view. Zooming in live view shows it is one sensor row read out wrong in live view mode. Full-resolution stills are clean because Canon's still pipeline maps such defects out. In 16:9 mode the crop window slides up 53 px so the row falls outside it, and no pixels are invented. In `native` mode the rows are covered with their neighbors. It's on by default for the 4000D. For another body, set `DSLR_WEBCAM_PATCH_ROWS="Y:H"` (even values) and please open an issue.
 - **One reader at a time.** Two apps opening the loopback device at once fight over the format. If OBS is using the DSLR, use OBS's Virtual Camera for everything else.
 - **Don't run other `gphoto2` commands while streaming.** The camera allows one PTP session. Run `dslr-webcam off` first.
 - If GNOME/gvfs auto-mounts the camera, the service unmounts it before streaming.
