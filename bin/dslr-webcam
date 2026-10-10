@@ -429,11 +429,14 @@ cmd_scan() {
     echo "It is already hidden by your config."
     return 0
   fi
-  local answer=y
-  if [[ -t 0 ]]; then
+  local answer=n
+  if [[ ${1:-} == --yes || ${1:-} == -y ]]; then
+    answer=y
+  elif [[ -t 0 ]]; then
     read -r -p "Hide it by saving DSLR_WEBCAM_HIDE_ROWS=\"$bands\" to your config? [Y/n] " answer
+    answer=${answer:-y}
   fi
-  if [[ ${answer:-y} =~ ^[Yy] ]]; then
+  if [[ $answer =~ ^[Yy] ]]; then
     set_config HIDE_ROWS "$bands"
     echo "Saved to $CONFIG_FILE. The stream restarts with it in a moment."
   else
@@ -476,6 +479,7 @@ Usage: dslr-webcam <command>
               (--json for machine-readable output)
   preview     Open a low-latency preview window (mpv or ffplay)
   scan        Find a fixed line in the video (a bad sensor row) and offer to hide it
+              (--yes saves the result without asking)
   config      Edit settings (--show: settings in effect, --reset: start over)
   doctor      Check dependencies and setup
   run         Stream in the foreground (used by the systemd service)
@@ -492,7 +496,7 @@ case "${1:-}" in
   restart) rm -f "$DISABLED_FLAG"; systemctl --user restart "$SERVICE" ;;
   status) cmd_status "${2:-}" ;;
   preview) cmd_preview ;;
-  scan) cmd_scan ;;
+  scan) cmd_scan "${2:-}" ;;
   config) cmd_config "${2:-}" ;;
   doctor) cmd_doctor ;;
   version | --version) echo "$VERSION" ;;
