@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 SERVICE="dslr-webcam.service"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/dslr-webcam/config"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dslr-webcam"
@@ -13,16 +13,17 @@ DISABLED_FLAG="$STATE_DIR/disabled"
 MODEL_FILE="$STATE_DIR/model"
 WRITER_PID_FILE="$STATE_DIR/writer.pid"
 
-# Defaults; override any of them in $CONFIG_FILE.
-DSLR_WEBCAM_DEVICE=""                 # e.g. /dev/video9; empty = first v4l2loopback device
-DSLR_WEBCAM_LABEL="DSLR Webcam"       # preferred v4l2loopback card_label
-DSLR_WEBCAM_RESOLUTION="1280x720"     # WxH (cropped to 16:9 and scaled) or "native"
-DSLR_WEBCAM_FPS=""                    # empty = camera rate (~25-30 fps)
-DSLR_WEBCAM_MIRROR=0                  # 1 = flip horizontally
-DSLR_WEBCAM_DISABLE_AUTOPOWEROFF=1    # set the camera's autopoweroff to 0 before streaming
-DSLR_WEBCAM_EXTRA_FILTERS=""          # appended to the ffmpeg -vf chain
-DSLR_WEBCAM_PATCH_ROWS="auto"         # "Y:H" hides a bad H-row band at Y in the camera
-                                      # frame (even values); "auto" = known models, "" = off
+# Defaults. Users override them in $CONFIG_FILE; config.example documents each.
+CONFIG_KEYS=(RESOLUTION CROP MIRROR FPS HIDE_ROWS EXTRA_FILTERS KEEP_AWAKE DEVICE LABEL)
+DSLR_WEBCAM_RESOLUTION="1280x720"
+DSLR_WEBCAM_CROP="center"
+DSLR_WEBCAM_MIRROR=0
+DSLR_WEBCAM_FPS=""
+DSLR_WEBCAM_HIDE_ROWS=""
+DSLR_WEBCAM_EXTRA_FILTERS=""
+DSLR_WEBCAM_KEEP_AWAKE=1
+DSLR_WEBCAM_DEVICE=""
+DSLR_WEBCAM_LABEL="DSLR Webcam"
 
 # shellcheck source=/dev/null
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
@@ -103,22 +104,26 @@ service_state() { systemctl --user is-active "$SERVICE" 2>/dev/null || true; }
 
 # --- Streaming ---------------------------------------------------------------
 
-# Some bodies burn a bright horizontal line into their USB live view frames
-# (the EOS 4000D at rows 597-598 of 1056x704). Prints the band to cover as
-# "Y:H", even-aligned because 4:2:0 overlays snap to even rows.
-patch_rows() {
-  if [[ $DSLR_WEBCAM_PATCH_ROWS != auto ]]; then
-    echo "$DSLR_WEBCAM_PATCH_ROWS"
-    return
-  fi
-  case "$(camera_model)" in
-    *"EOS 4000D"* | *"Rebel T100"*) echo "596:4" ;;
-  esac
+# A camera with a defective sensor row can show a bright or dark line in live
+# view only (stills are defect-mapped). Prints HIDE_ROWS as "Y:H", widened to
+# even rows because 4:2:0 crops and overlays snap to even rows.
+hidden_rows() {
+  [[ $DSLR_WEBCAM_HIDE_ROWS =~ ^([0-9]+):([0-9]+)$ ]] || return 0
+  local y=${BASH_REMATCH[1]} n=${BASH_REMATCH[2]} end
+  end=$(( y + n ))
+  y=$(( y - y % 2 ))
+  end=$(( end + end % 2 ))
+  echo "$y:$(( end - y ))"
 }
 
 video_filters() {
-  local filters="" w h patch y n crop_y="(ih-oh)/2"
-  patch=$(patch_rows)
+  local filters="" w h patch y n crop_y
+  case "$DSLR_WEBCAM_CROP" in
+    top) crop_y="0" ;;
+    bottom) crop_y="ih-oh" ;;
+    *) crop_y="(ih-oh)/2" ;;
+  esac
+  patch=$(hidden_rows)
   if [[ $patch == *:* ]]; then
     y=${patch%:*}
     n=${patch#*:}
@@ -127,9 +132,10 @@ video_filters() {
     w=${DSLR_WEBCAM_RESOLUTION%x*}
     h=${DSLR_WEBCAM_RESOLUTION#*x}
     if [[ -n ${y:-} ]]; then
-      # Slide the crop window off the bad band: keep it centered if it already
-      # misses the band, otherwise end it just above (or start just below) it.
-      crop_y="if(lt($y,(ih+oh)/2)*gt($((y + n)),(ih-oh)/2),if(gte($y-oh,0),$y-oh,$((y + n))),(ih-oh)/2)"
+      # Slide the crop window off the hidden band: keep it where CROP put it
+      # if it already misses the band, otherwise end it just above (or start
+      # just below) the band.
+      crop_y="if(lt($y,($crop_y)+oh)*gt($((y + n)),$crop_y),if(gte($y-oh,0),$y-oh,$((y + n))),$crop_y)"
     fi
     # Crop the camera's 3:2 live view to the target aspect, then scale.
     filters="crop='min(iw,ih*$w/$h)':'min(ih,iw*$h/$w)':'(iw-ow)/2':'$crop_y',scale=$w:$h"
@@ -148,7 +154,7 @@ prepare_camera() {
   local model
   model=$(gphoto2 --auto-detect 2>/dev/null | awk 'NR>2 && NF { sub(/[[:space:]]+usb:.*/, ""); print; exit }')
   [[ -n $model ]] && printf '%s\n' "$model" >"$MODEL_FILE"
-  if [[ $DSLR_WEBCAM_DISABLE_AUTOPOWEROFF == 1 ]]; then
+  if [[ $DSLR_WEBCAM_KEEP_AWAKE == 1 ]]; then
     gphoto2 --set-config autopoweroff=0 >/dev/null 2>&1 || true
   fi
 }
@@ -286,6 +292,155 @@ cmd_preview() {
   die "install mpv or ffplay to preview"
 }
 
+# --- Configuration -----------------------------------------------------------
+
+template_file() {
+  local dir
+  dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.."
+  echo "$dir/config.example"
+}
+
+ensure_config() {
+  [[ -f $CONFIG_FILE ]] && return 0
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  if [[ -f $(template_file) ]]; then
+    cp "$(template_file)" "$CONFIG_FILE"
+  else
+    echo "# dslr-webcam settings; see 'dslr-webcam config --show'" >"$CONFIG_FILE"
+  fi
+}
+
+# Sets KEY=value in the config, replacing an existing or commented-out line.
+set_config() {
+  local key="DSLR_WEBCAM_$1" value="$2" line
+  ensure_config
+  line="$key=\"$value\""
+  if grep -qE "^#?$key=" "$CONFIG_FILE"; then
+    sed -i -E "s|^#?$key=.*|$line|" "$CONFIG_FILE"
+  else
+    echo "$line" >>"$CONFIG_FILE"
+  fi
+}
+
+cmd_config() {
+  case "${1:-}" in
+    --show | show)
+      local key var
+      echo "# $CONFIG_FILE$([[ -f $CONFIG_FILE ]] || echo ' (not created yet, all defaults)')"
+      for key in "${CONFIG_KEYS[@]}"; do
+        var="DSLR_WEBCAM_$key"
+        printf '%-26s = %s\n' "$var" "${!var:-(empty)}"
+      done
+      ;;
+    --path | path)
+      echo "$CONFIG_FILE"
+      ;;
+    --reset | reset)
+      [[ -f $CONFIG_FILE ]] && mv "$CONFIG_FILE" "$CONFIG_FILE.bak.$(date +%s)" && log "old config backed up"
+      ensure_config
+      ;;
+    "")
+      # Saved changes are applied by dslr-webcam-config.path, however the file
+      # was edited.
+      ensure_config
+      if [[ -t 0 && -t 1 ]]; then
+        ${EDITOR:-omarchy-launch-editor --inline} "$CONFIG_FILE"
+      elif command -v omarchy-launch-editor >/dev/null 2>&1; then
+        omarchy-launch-editor "$CONFIG_FILE"
+      else
+        xdg-open "$CONFIG_FILE"
+      fi
+      ;;
+    *)
+      die "usage: dslr-webcam config [--show | --path | --reset]"
+      ;;
+  esac
+}
+
+# --- Line scan ---------------------------------------------------------------
+
+# Prints the mean brightness of every row of an image, one per line.
+row_means() {
+  ffmpeg -v error -i "$1" -vf "format=gray,scale=1:ih:flags=area" -f rawvideo - | od -An -tu1 -v | tr -s ' ' '\n' | grep -v '^$'
+}
+
+# Looks for rows that stand out from the rows around them in every one of
+# several live view frames: the signature of a defective sensor row rather
+# than something in the scene.
+cmd_scan() {
+  local was_active=0 frames=() i bands
+  command -v gphoto2 >/dev/null || die "gphoto2 is not installed"
+  camera_connected || die "no camera connected"
+  [[ $(service_state) == active ]] && was_active=1
+  SCAN_TMP=$(mktemp -d)
+  trap 'rm -rf "$SCAN_TMP"' EXIT
+
+  echo "Looking for a fixed line in the camera's live view."
+  echo "Aim the camera at a plain, evenly lit surface (a wall works) and keep it still."
+  (( was_active )) && log "pausing the stream" && systemctl --user stop "$SERVICE"
+  gphoto2 --reset >/dev/null 2>&1 && sleep 3
+  for i in 1 2 3 4 5; do
+    gphoto2 --capture-preview --force-overwrite --filename "$SCAN_TMP/f$i.jpg" >/dev/null 2>&1 || true
+    [[ -f $SCAN_TMP/thumb_f$i.jpg ]] && frames+=("$SCAN_TMP/thumb_f$i.jpg")
+    sleep 0.5
+  done
+  (( was_active )) && log "resuming the stream" && systemctl --user start "$SERVICE"
+  (( ${#frames[@]} >= 3 )) || die "could not capture live view frames"
+
+  for i in "${!frames[@]}"; do row_means "${frames[$i]}" >"$SCAN_TMP/rows$i"; done
+
+  # A row is flagged when it differs from the median of the 9 rows around it
+  # by more than the threshold, in every frame. The median ignores the line
+  # itself, so only the line's own rows are flagged.
+  bands=$(paste "$SCAN_TMP"/rows* | awk -v threshold=8 '
+    function median(y, f,   i, n, a, j, t) {
+      n = 0
+      for (i = y - 4; i <= y + 4; i++) a[++n] = v[i, f]
+      for (i = 2; i <= n; i++) { t = a[i]; for (j = i - 1; j > 0 && a[j] > t; j--) a[j + 1] = a[j]; a[j + 1] = t }
+      return a[5]
+    }
+    { for (f = 1; f <= NF; f++) v[NR, f] = $f; frames = NF; rows = NR }
+    END {
+      start = -1
+      for (y = 5; y <= rows - 4; y++) {
+        bad = 1
+        for (f = 1; f <= frames; f++) {
+          d = v[y, f] - median(y, f)
+          if (d < threshold && d > -threshold) { bad = 0; break }
+        }
+        if (bad && start < 0) start = y
+        if (!bad && start >= 0) { printf "%d:%d\n", start - 1, y - start; start = -1 }
+      }
+    }')
+
+  if [[ -z $bands ]]; then
+    echo "No fixed line found. Nothing to change."
+    return 0
+  fi
+  if (( $(wc -l <<<"$bands") > 1 )); then
+    echo "Found several lines, which is more likely the scene than the camera:"
+    sed 's/^/  rows /' <<<"$bands"
+    echo "Aim at a plain wall and run the scan again."
+    return 1
+  fi
+
+  echo "Found a line at rows $bands (first row:number of rows) of the camera frame."
+  if [[ $DSLR_WEBCAM_HIDE_ROWS == "$bands" ]]; then
+    echo "It is already hidden by your config."
+    return 0
+  fi
+  local answer=y
+  if [[ -t 0 ]]; then
+    read -r -p "Hide it by saving DSLR_WEBCAM_HIDE_ROWS=\"$bands\" to your config? [Y/n] " answer
+  fi
+  if [[ ${answer:-y} =~ ^[Yy] ]]; then
+    set_config HIDE_ROWS "$bands"
+    echo "Saved to $CONFIG_FILE. The stream restarts with it in a moment."
+  else
+    echo "Not saved. To hide it later, set DSLR_WEBCAM_HIDE_ROWS=\"$bands\" in $CONFIG_FILE"
+  fi
+}
+
 cmd_doctor() {
   local ok=1 dev
   check() {
@@ -320,6 +475,8 @@ Usage: dslr-webcam <command>
   status      Show camera, service, device, and which apps are using it
               (--json for machine-readable output)
   preview     Open a low-latency preview window (mpv or ffplay)
+  scan        Find a fixed line in the video (a bad sensor row) and offer to hide it
+  config      Edit settings (--show: settings in effect, --reset: start over)
   doctor      Check dependencies and setup
   run         Stream in the foreground (used by the systemd service)
 
@@ -335,6 +492,8 @@ case "${1:-}" in
   restart) rm -f "$DISABLED_FLAG"; systemctl --user restart "$SERVICE" ;;
   status) cmd_status "${2:-}" ;;
   preview) cmd_preview ;;
+  scan) cmd_scan ;;
+  config) cmd_config "${2:-}" ;;
   doctor) cmd_doctor ;;
   version | --version) echo "$VERSION" ;;
   -h | --help | help | "") usage ;;

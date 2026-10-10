@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply dslr-webcam settings when the config file is saved
+
+[Path]
+PathChanged=%h/.config/dslr-webcam/config
+Unit=dslr-webcam-config.service
+
+[Install]
+WantedBy=default.target

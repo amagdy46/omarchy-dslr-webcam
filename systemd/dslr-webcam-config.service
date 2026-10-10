@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart the DSLR webcam stream with new settings
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user try-restart dslr-webcam.service

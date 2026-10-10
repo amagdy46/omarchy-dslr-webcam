@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "amagdy46.dslr-webcam",
   "name": "DSLR Webcam",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "amagdy46",
   "license": "MIT",
   "description": "Use a Canon/Nikon/Sony camera as an always-on webcam via gphoto2 and v4l2loopback, with a bar toggle.",
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "DSLR Webcam",
-    "description": "Camera status; left-click toggles the stream, right-click opens a preview, middle-click restarts it.",
+    "description": "Camera status; left-click toggles the stream, right-click opens a preview, middle-click opens settings.",
     "category": "Media",
     "allowMultiple": false,
     "defaultSection": "right",

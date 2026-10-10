@@ -1,0 +1,55 @@
+# dslr-webcam settings
+#
+# Uncomment a line and change its value to override the default shown.
+# Changes apply as soon as you save: the stream restarts by itself.
+# Open this file with `dslr-webcam config` or a middle-click on the bar icon.
+#
+# See every setting in effect: dslr-webcam config --show
+
+# ── Picture ──────────────────────────────────────────────────────────────────
+
+# Output size. The camera's live view is 3:2 (e.g. 1056x704 on most Canons).
+# A WxH size crops it to that aspect ratio and scales it, which is what video
+# call and streaming apps expect. "native" sends the camera frame unchanged.
+#   Examples: 1280x720 · 1920x1080 · 960x540 · native
+#DSLR_WEBCAM_RESOLUTION=1280x720
+
+# Which part of the frame to keep when cropping to a wider aspect ratio.
+#   center · top · bottom
+#DSLR_WEBCAM_CROP=center
+
+# Mirror the image horizontally, like a selfie camera. 0 = off, 1 = on.
+# Most video call apps already mirror your self-view without changing what
+# others see, so leave this off unless you want everyone to see it flipped.
+#DSLR_WEBCAM_MIRROR=0
+
+# Frame rate cap. Empty = whatever the camera delivers (usually 25-30 fps).
+#DSLR_WEBCAM_FPS=
+
+# Hide a thin horizontal line that is always at the same place in the video.
+# Some cameras have a sensor row that misbehaves only in live view (photos
+# look fine). Run `dslr-webcam scan` to find it and save this setting.
+# Format: FIRST_ROW:NUMBER_OF_ROWS, counted in the camera's frame.
+# With a cropped RESOLUTION the crop moves so the rows fall outside it;
+# with "native" they are filled in from the rows next to them.
+#DSLR_WEBCAM_HIDE_ROWS=
+
+# Extra ffmpeg video filters, appended last. For tweaks like
+#   eq=brightness=0.04:saturation=1.1   or   rotate=PI
+#DSLR_WEBCAM_EXTRA_FILTERS=
+
+# ── Camera ───────────────────────────────────────────────────────────────────
+
+# Stop the camera from switching itself off while streaming, by setting its
+# auto power-off to "never" over USB. 0 = leave the camera's setting alone.
+#DSLR_WEBCAM_KEEP_AWAKE=1
+
+# ── Device ───────────────────────────────────────────────────────────────────
+
+# Which v4l2loopback device to write to. Empty = the one named LABEL, or else
+# the first loopback device found.
+#DSLR_WEBCAM_DEVICE=/dev/video0
+
+# Name apps show for the webcam. Matches card_label in the v4l2loopback
+# module options (/etc/modprobe.d/).
+#DSLR_WEBCAM_LABEL="DSLR Webcam"

@@ -9,7 +9,7 @@ import qs.Ui
 //
 //   left click    toggle the stream on/off (persists across replugs)
 //   right click   open a low-latency preview window
-//   middle click  restart the stream
+//   middle click  open the settings file
 BarWidget {
   id: root
   moduleName: "amagdy46.dslr-webcam"
@@ -40,12 +40,18 @@ BarWidget {
     actionProc.running = true
   }
 
+  readonly property string hints: "\nClick: on/off · Right-click: preview · Middle-click: settings"
+
   function tooltip() {
+    return state() + (installed ? hints : "")
+  }
+
+  function state() {
     if (!installed) return "DSLR webcam: run install.sh from the plugin folder"
     var model = status.model || "Camera"
     if (!camera) return enabled ? "DSLR webcam: no camera connected" : "DSLR webcam: off"
     if (!enabled) return model + ": webcam off (click to turn on)"
-    if (failed) return model + ": live view failed (middle-click to retry)"
+    if (failed) return model + ": live view failed (click twice to retry)"
     if (inUse) return model + ": live on " + status.device + ", in use by " + consumers
     if (streaming) return model + ": live on " + status.device
     return model + ": starting…"
@@ -91,7 +97,7 @@ BarWidget {
     onPressed: function(b) {
       if (!root.installed) return
       if (b === Qt.RightButton) Quickshell.execDetached([root.cli, "preview"])
-      else if (b === Qt.MiddleButton) root.runCli(["restart"])
+      else if (b === Qt.MiddleButton) Quickshell.execDetached([root.cli, "config"])
       else root.runCli(["toggle"])
     }
   }

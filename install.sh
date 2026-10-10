@@ -41,9 +41,19 @@ sudo udevadm control --reload
 
 step "Installing systemd user service"
 mkdir -p "$UNIT_DIR"
-install -m644 "$ROOT/systemd/dslr-webcam.service" "$UNIT_DIR/dslr-webcam.service"
+install -m644 "$ROOT"/systemd/dslr-webcam{.service,-config.path,-config.service} "$UNIT_DIR/"
 systemctl --user daemon-reload
 systemctl --user enable dslr-webcam.service >/dev/null
+systemctl --user enable --now dslr-webcam-config.path >/dev/null
+
+step "Creating settings file"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/dslr-webcam/config"
+if [[ -f $CONFIG_FILE ]]; then
+  echo "    keeping existing $CONFIG_FILE"
+else
+  install -Dm644 "$ROOT/config.example" "$CONFIG_FILE"
+  echo "    $CONFIG_FILE (edit with: dslr-webcam config)"
+fi
 
 step "Starting"
 "$BIN_DIR/dslr-webcam" on || true
