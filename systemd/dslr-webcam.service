@@ -1,0 +1,14 @@
+[Unit]
+Description=DSLR webcam (gphoto2 live view -> v4l2loopback)
+Documentation=https://github.com/amagdy46/omarchy-dslr-webcam
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dslr-webcam run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

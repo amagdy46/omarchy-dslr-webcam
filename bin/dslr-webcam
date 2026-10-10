@@ -1,0 +1,309 @@
+#!/bin/bash
+
+# dslr-webcam: use a gphoto2-supported camera (Canon EOS, Nikon, Sony, ...) as
+# an always-on Linux webcam by piping its live view into a v4l2loopback device.
+
+set -uo pipefail
+
+VERSION="0.1.0"
+SERVICE="dslr-webcam.service"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/dslr-webcam/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dslr-webcam"
+DISABLED_FLAG="$STATE_DIR/disabled"
+MODEL_FILE="$STATE_DIR/model"
+WRITER_PID_FILE="$STATE_DIR/writer.pid"
+
+# Defaults; override any of them in $CONFIG_FILE.
+DSLR_WEBCAM_DEVICE=""                 # e.g. /dev/video9; empty = first v4l2loopback device
+DSLR_WEBCAM_LABEL="DSLR Webcam"       # preferred v4l2loopback card_label
+DSLR_WEBCAM_RESOLUTION="1280x720"     # WxH (cropped to 16:9 and scaled) or "native"
+DSLR_WEBCAM_FPS=""                    # empty = camera rate (~25-30 fps)
+DSLR_WEBCAM_MIRROR=0                  # 1 = flip horizontally
+DSLR_WEBCAM_DISABLE_AUTOPOWEROFF=1    # set the camera's autopoweroff to 0 before streaming
+DSLR_WEBCAM_EXTRA_FILTERS=""          # appended to the ffmpeg -vf chain
+
+# shellcheck source=/dev/null
+[[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
+
+log() { echo "dslr-webcam: $*" >&2; }
+die() { log "$*"; exit 1; }
+
+notify() {
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send "$@" >/dev/null 2>&1 &
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send "$@" >/dev/null 2>&1 &
+  fi
+}
+
+# --- Detection ---------------------------------------------------------------
+
+# Prints "busnum devnum product" for the first USB still-image (PTP) camera.
+# Reads sysfs only, so it never claims the camera away from a running stream.
+camera_usb() {
+  local intf dev
+  for intf in /sys/bus/usb/devices/*:*; do
+    [[ $(cat "$intf/bInterfaceClass" 2>/dev/null) == 06 ]] || continue
+    dev="${intf%:*}"
+    printf '%s %s %s\n' "$(cat "$dev/busnum")" "$(cat "$dev/devnum")" "$(cat "$dev/product" 2>/dev/null || echo Camera)"
+    return 0
+  done
+  return 1
+}
+
+camera_connected() { camera_usb >/dev/null; }
+
+camera_model() {
+  local usb
+  usb=$(camera_usb) || return 1
+  if [[ -s $MODEL_FILE ]]; then cat "$MODEL_FILE"; else echo "${usb#* * }"; fi
+}
+
+is_loopback() {
+  v4l2-ctl -d "$1" --info 2>/dev/null | grep -qi 'loopback'
+}
+
+loopback_device() {
+  local dev name fallback=""
+  if [[ -n $DSLR_WEBCAM_DEVICE ]]; then
+    [[ -e $DSLR_WEBCAM_DEVICE ]] && echo "$DSLR_WEBCAM_DEVICE" && return 0
+    return 1
+  fi
+  for dev in /sys/devices/virtual/video4linux/video*; do
+    [[ -e $dev ]] || continue
+    name=$(cat "$dev/name" 2>/dev/null)
+    is_loopback "/dev/${dev##*/}" || continue
+    if [[ $name == "$DSLR_WEBCAM_LABEL" ]]; then echo "/dev/${dev##*/}"; return 0; fi
+    [[ -z $fallback ]] && fallback="/dev/${dev##*/}"
+  done
+  [[ -n $fallback ]] && echo "$fallback" && return 0
+  return 1
+}
+
+# PIDs of processes reading the loopback device, excluding our own writer.
+consumers() {
+  local dev="$1" writer="" pid
+  [[ -f $WRITER_PID_FILE ]] && writer=$(cat "$WRITER_PID_FILE")
+  for pid in $(fuser "$dev" 2>/dev/null); do
+    [[ $pid == "$writer" ]] && continue
+    echo "$pid"
+  done
+}
+
+consumer_names() {
+  local pid
+  for pid in $(consumers "$1"); do
+    cat "/proc/$pid/comm" 2>/dev/null
+  done | sort -u | paste -sd, -
+}
+
+service_state() { systemctl --user is-active "$SERVICE" 2>/dev/null || true; }
+
+# --- Streaming ---------------------------------------------------------------
+
+video_filters() {
+  local filters="" w h
+  if [[ $DSLR_WEBCAM_RESOLUTION != native ]]; then
+    w=${DSLR_WEBCAM_RESOLUTION%x*}
+    h=${DSLR_WEBCAM_RESOLUTION#*x}
+    # Crop the camera's 3:2 live view to the target aspect, then scale.
+    filters="crop='min(iw,ih*$w/$h)':'min(ih,iw*$h/$w)',scale=$w:$h"
+  fi
+  [[ $DSLR_WEBCAM_MIRROR == 1 ]] && filters="${filters:+$filters,}hflip"
+  [[ -n $DSLR_WEBCAM_FPS ]] && filters="${filters:+$filters,}fps=$DSLR_WEBCAM_FPS"
+  [[ -n $DSLR_WEBCAM_EXTRA_FILTERS ]] && filters="${filters:+$filters,}$DSLR_WEBCAM_EXTRA_FILTERS"
+  echo "${filters:+$filters,}format=yuv420p"
+}
+
+prepare_camera() {
+  local model
+  model=$(gphoto2 --auto-detect 2>/dev/null | awk 'NR>2 && NF { sub(/[[:space:]]+usb:.*/, ""); print; exit }')
+  [[ -n $model ]] && printf '%s\n' "$model" >"$MODEL_FILE"
+  if [[ $DSLR_WEBCAM_DISABLE_AUTOPOWEROFF == 1 ]]; then
+    gphoto2 --set-config autopoweroff=0 >/dev/null 2>&1 || true
+  fi
+}
+
+release_gvfs() {
+  # gvfs mounts the camera as a filesystem and holds the PTP session.
+  command -v gio >/dev/null 2>&1 || return 0
+  gio mount -l 2>/dev/null | grep -o 'gphoto2://[^ ]*' | sort -u | while read -r uri; do
+    gio mount -u "$uri" >/dev/null 2>&1 || true
+  done
+  pkill -x gvfsd-gphoto2 2>/dev/null || true
+}
+
+stream_once() {
+  local dev="$1" vf
+  vf=$(video_filters)
+  log "streaming $(camera_model) -> $dev ($DSLR_WEBCAM_RESOLUTION)"
+  gphoto2 --stdout --capture-movie 2> >(grep -v -E '^(Capturing preview frames|Movie capture)' >&2) |
+    ffmpeg -hide_banner -loglevel error -nostats \
+      -fflags nobuffer -flags low_delay -f mjpeg -i - \
+      -vf "$vf" -f v4l2 "$dev" &
+  echo $! >"$WRITER_PID_FILE"
+  local started=$SECONDS rc
+  wait $!
+  rc=$?
+  rm -f "$WRITER_PID_FILE"
+  # A stream that ran for a while was healthy; don't count it toward giving up.
+  (( SECONDS - started > 60 )) && failures=0
+  return $rc
+}
+
+cmd_run() {
+  mkdir -p "$STATE_DIR"
+  if [[ -e $DISABLED_FLAG ]]; then
+    log "disabled (run 'dslr-webcam on' to enable)"
+    exit 0
+  fi
+  local dev failures=0
+  dev=$(loopback_device) || die "no v4l2loopback device found; run 'dslr-webcam doctor'"
+
+  trap 'pkill -P $$ 2>/dev/null; rm -f "$WRITER_PID_FILE"; exit 0' TERM INT
+
+  while true; do
+    if ! camera_connected; then
+      log "camera disconnected"
+      exit 0
+    fi
+    release_gvfs
+    prepare_camera
+    stream_once "$dev"
+    # Give USB a moment to settle before deciding whether the camera is gone.
+    sleep 2
+    camera_connected || { log "camera disconnected"; exit 0; }
+    failures=$((failures + 1))
+    log "stream stopped (attempt $failures); resetting camera and restarting"
+    # A PTP timeout wedges the camera's USB session until it is reset.
+    gphoto2 --reset >/dev/null 2>&1 || true
+    sleep 3
+    if (( failures >= 5 )); then
+      notify -u critical "DSLR webcam" "Live view keeps failing. Is the camera on and in photo mode?"
+      exit 1
+    fi
+  done
+}
+
+# --- Control -----------------------------------------------------------------
+
+cmd_on() {
+  mkdir -p "$STATE_DIR"
+  rm -f "$DISABLED_FLAG"
+  if camera_connected; then
+    systemctl --user restart "$SERVICE"
+  else
+    log "enabled; streaming will start when the camera is connected"
+  fi
+}
+
+cmd_off() {
+  mkdir -p "$STATE_DIR"
+  touch "$DISABLED_FLAG"
+  systemctl --user stop "$SERVICE"
+}
+
+cmd_toggle() {
+  if [[ -e $DISABLED_FLAG ]]; then
+    cmd_on && notify "DSLR webcam" "Webcam on"
+  else
+    cmd_off && notify "DSLR webcam" "Webcam off"
+  fi
+}
+
+json_escape() {
+  local s="${1//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+cmd_status() {
+  local json=0 dev="" model="" camera=false enabled=true state names=""
+  [[ ${1:-} == --json ]] && json=1
+  [[ -e $DISABLED_FLAG ]] && enabled=false
+  camera_connected && camera=true && model=$(camera_model)
+  dev=$(loopback_device 2>/dev/null) || dev=""
+  state=$(service_state)
+  [[ -n $dev ]] && names=$(consumer_names "$dev")
+
+  if (( json )); then
+    printf '{"installed":true,"enabled":%s,"camera":%s,"model":%s,"service":%s,"device":%s,"consumers":%s}\n' \
+      "$enabled" "$camera" "$(json_escape "$model")" "$(json_escape "$state")" \
+      "$(json_escape "$dev")" "$(json_escape "$names")"
+    return 0
+  fi
+
+  echo "enabled:   $enabled"
+  echo "camera:    ${model:-not connected}"
+  echo "service:   $state"
+  echo "device:    ${dev:-none (v4l2loopback not loaded)}"
+  echo "in use by: ${names:-nothing}"
+}
+
+cmd_preview() {
+  local dev
+  dev=$(loopback_device) || die "no v4l2loopback device found"
+  if command -v mpv >/dev/null 2>&1; then
+    exec mpv --title="DSLR webcam preview" --profile=low-latency --untimed --no-cache \
+      --demuxer-lavf-format=video4linux2 "av://v4l2:$dev"
+  elif command -v ffplay >/dev/null 2>&1; then
+    exec ffplay -hide_banner -loglevel error -window_title "DSLR webcam preview" \
+      -fflags nobuffer -f v4l2 "$dev"
+  fi
+  die "install mpv or ffplay to preview"
+}
+
+cmd_doctor() {
+  local ok=1 dev
+  check() {
+    if eval "$2" >/dev/null 2>&1; then printf '  \e[32m✓\e[0m %s\n' "$1"
+    else printf '  \e[31m✗\e[0m %s\n      %s\n' "$1" "$3"; ok=0; fi
+  }
+  echo "dslr-webcam $VERSION"
+  check "gphoto2 installed" "command -v gphoto2" "sudo pacman -S gphoto2"
+  check "ffmpeg installed" "command -v ffmpeg" "sudo pacman -S ffmpeg"
+  check "v4l2-ctl installed" "command -v v4l2-ctl" "sudo pacman -S v4l-utils"
+  check "fuser installed" "command -v fuser" "sudo pacman -S psmisc"
+  check "v4l2loopback module loaded" "lsmod | grep -q '^v4l2loopback'" "run ./install.sh (installs v4l2loopback-dkms + modprobe config)"
+  check "v4l2loopback device present" "loopback_device" "sudo modprobe v4l2loopback exclusive_caps=1 card_label='DSLR Webcam'"
+  check "camera connected (USB PTP)" "camera_connected" "plug in the camera, turn it on, set the mode dial to a photo mode"
+  check "udev autostart rule installed" "test -f /etc/udev/rules.d/90-dslr-webcam.rules" "run ./install.sh"
+  check "systemd user service installed" "systemctl --user cat $SERVICE" "run ./install.sh"
+  check "no gvfs gphoto2 mount holding the camera" "! pgrep -x gvfsd-gphoto2" "gio mount -u gphoto2://..., or uninstall gvfs-gphoto2"
+  dev=$(loopback_device 2>/dev/null) && echo "  device: $dev ($(cat "/sys/class/video4linux/${dev##*/}/name" 2>/dev/null))"
+  (( ok ))
+}
+
+usage() {
+  cat <<EOF
+dslr-webcam $VERSION: use a DSLR/mirrorless camera as an always-on webcam
+
+Usage: dslr-webcam <command>
+
+  on          Enable and start streaming (stays on across replugs and reboots)
+  off         Stop streaming and keep it off until 'on'
+  toggle      Switch between on and off
+  restart     Restart the stream
+  status      Show camera, service, device, and which apps are using it
+              (--json for machine-readable output)
+  preview     Open a low-latency preview window (mpv or ffplay)
+  doctor      Check dependencies and setup
+  run         Stream in the foreground (used by the systemd service)
+
+Config: $CONFIG_FILE
+EOF
+}
+
+case "${1:-}" in
+  run) cmd_run ;;
+  on | start) cmd_on ;;
+  off | stop) cmd_off ;;
+  toggle) cmd_toggle ;;
+  restart) rm -f "$DISABLED_FLAG"; systemctl --user restart "$SERVICE" ;;
+  status) cmd_status "${2:-}" ;;
+  preview) cmd_preview ;;
+  doctor) cmd_doctor ;;
+  version | --version) echo "$VERSION" ;;
+  -h | --help | help | "") usage ;;
+  *) usage >&2; exit 2 ;;
+esac
